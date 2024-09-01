@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[350]:
+# In[45]:
 
 
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 from PIL import Image
 import io
 import cv2
@@ -15,18 +16,26 @@ import torch
 from torch.utils.data import Dataset
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
+from resnest.torch import resnest101
+import torch.optim as optim
+import random
+from sklearn.metrics import roc_curve, auc
 
 
 # ### 图像部分的baseline
 
-# In[13]:
+# In[15]:
 
 
 work_dir = '/Users/zhouyangfan/Desktop/kaggle/isic/isic-2024-challenge/'
-train_hdf5 = work_dir + 'train-image.hdf5'
-test_hdf5 = work_dir + 'test-image.hdf5'
+train_hdf5_path = work_dir + 'train-image.hdf5'
 train_csv_path = work_dir + 'train-metadata.csv'
-test_csv_path = work_dir + 'test-metadata.csv'
+
+
+# In[30]:
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 
 # In[7]:
@@ -35,95 +44,75 @@ test_csv_path = work_dir + 'test-metadata.csv'
 # csv文件读入
 train_csv = pd.read_csv(train_csv_path)
 train_csv
-test_csv = pd.read_csv(test_csv_path)
-test_csv
 
 
-# In[14]:
+# In[8]:
 
 
-def get_train_file_path(image_id):
-    return f"{work_dir}train-image/image/{image_id}.jpg"
+train_csv
 
 
-# In[ ]:
+# In[9]:
 
 
-# # hdf5文件读入
-# train_dataset = h5py.File(train_hdf5, 'r')
-# train_images = {}
-# for image in train_dataset.keys():
-#     train_image = train_dataset[image]
-#     img_plt = Image.open(io.BytesIO(np.array(train_image)))
-#     img_array = np.array(img_plt)
-#     train_images[image] = img_array
-# test_dataset = h5py.File(test_hdf5, 'r')
-# test_images = {}
-# for image in test_dataset.keys():
-#     test_image = test_dataset[image]
-#     img_plt = Image.open(io.BytesIO(np.array(test_image)))
-#     img_array = np.array(img_plt)
-#     test_images[image] = img_array
-
-
-# In[123]:
-
-
+# def get_train_file_path(image_id):
+#     return f"{work_dir}train-image/image/{image_id}.jpg"
 # 样本均衡
 train_csv_positive = train_csv[train_csv.target == 1]
 train_csv_negative = train_csv[train_csv.target == 0].sample(frac=1.0)
 # 正负样本比 1:5
 train_csv_balanced = pd.concat([train_csv_positive, train_csv_negative.iloc[:train_csv_positive.shape[0] * 5, :]]).sample(frac=1.0).reset_index(drop=True)
-
-
-# In[323]:
-
-
-train_csv_negative.shape
-
-
-# In[322]:
-
-
-train_csv_balanced.shape
-
-
-# In[124]:
-
-
-train_csv_balanced
-
-
-# In[127]:
-
-
 # train_csv_balanced
 train_csv_balanced["file_path"] = train_csv_balanced["isic_id"].apply(get_train_file_path)
-
-
-# In[128]:
-
-
 # 训练集和验证集划分
 train_csv_balanced["fold"] = np.random.randint(1, 6, size = train_csv_balanced.shape[0])
 valid_csv_fold = train_csv_balanced[train_csv_balanced.fold == 5]
 train_csv_fold = train_csv_balanced[train_csv_balanced.fold != 5]
 
 
-# In[330]:
+# In[11]:
 
 
-train_csv_fold.shape
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+set_seed(88)
 
 
 # In[129]:
 
 
-# 不加 transform
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+aug_transform = A.Compose([
+    A.RandomRotate90(),
+    A.Flip(),
+    A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.1, p=0.5),
+    A.Resize(200, 200),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
+])
+
+base_transform = A.Compose([
+    A.Resize(200, 200),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
+])
+
+
+# In[142]:
+
+
 class MelanomaDataset(Dataset):
-    def __init__(self, csv,  mode, transform=None):
+    def __init__(self, csv,  mode, hdf5_data_path, transform=None):
         self.csv = csv.reset_index(drop=True)
         self.mode = mode
+        self.hdf5_data = h5py.File(hdf5_data_path, 'r')
         self.transform = transform
 
     def __len__(self):
@@ -132,18 +121,21 @@ class MelanomaDataset(Dataset):
     def __getitem__(self, index):
 
         row = self.csv.iloc[index]
-        #image = self.img_dict[row.isic_id]
-        image = cv2.imread(row.file_path)
-        image = cv2.resize(image, (200, 200))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
+        img_name = row['isic_id']
+        image = np.array(self.hdf5_data[img_name])
+        image = np.array(Image.open(io.BytesIO(image)))#, dtype=np.float32
+        #image = cv2.imread(row.file_path)
+        
+        
         if self.transform is not None:
-            res = self.transform(image=image)
-            image = res['image'].astype(np.float32)
-        else:
             image = image.astype(np.float32)
-
-        image = image.transpose(2, 0, 1)
+            res = self.transform(image=image)
+            image = res['image']
+        else:
+            image = cv2.resize(image, (224, 224))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = image.astype(np.float32)
+            image = image.transpose(2, 0, 1)
         
         data = torch.tensor(image).float()
 
@@ -153,7 +145,7 @@ class MelanomaDataset(Dataset):
             return data, torch.tensor(self.csv.iloc[index].target).long()
 
 
-# In[310]:
+# In[143]:
 
 
 class CNN(nn.Module):
@@ -197,6 +189,7 @@ class CNN(nn.Module):
                          # +
                          # 'Input csv_data shape:', csv_data.shape)
         
+        #print("Begin", image.size())
         # Image CNN
         image = self.features(image)
         #print("After conv2:", image.size())
@@ -211,7 +204,65 @@ class CNN(nn.Module):
         return out
 
 
-# In[400]:
+# In[144]:
+
+
+# class Resnest_Melanoma(nn.Module):
+#     def __init__(self, enet_type, out_dim,pretrained = False):
+#         super(Resnest_Melanoma, self).__init__()
+#         self.enet = resnest101(pretrained=pretrained)
+#         in_ch = self.enet.fc.out_features
+#         self.myfc = nn.Linear(in_ch, out_dim)
+        
+#     def extract(self, x):
+#         x = self.enet(x)
+#         return x
+
+#     def forward(self, x, x_meta=None):
+#         x = self.extract(x)
+#         return self.myfc(x.squeeze(-1).squeeze(-1))
+
+
+# In[145]:
+
+
+# model = resnest101(pretrained=False)
+# model.load_state_dict(torch.load(model_path, 'mps'))
+# a = torch.load(model_path, 'mps')
+# model_path = work_dir + "resnest101-22405ba7.pth"
+# import torch
+
+# # 5.加载ResNet101模型
+# model = resnest101(pretrained=False)
+# # 加载预训练好的ResNet模型
+# #model.load_state_dict(torch.load(model_path, 'mps'))
+# # # 冻结模型参数
+# # for param in model.parameters():
+# #     param.requires_grad = False
+# model.fc = nn.Linear(2048, 2)
+# model.to("mps")
+# for i in torch.load(model_path, 'mps'):
+#     if 
+#     print(i)
+#device = torch.device("mps")
+#device = torch.device("cpu")
+# model_resnet = Resnest_Melanoma('resnest101', out_dim = 2)
+# model_resnet.to(device)
+# model_resnet.train()
+# for (data, target) in train_loader:
+#     data, target = data.to(device), target.to(device)
+#     logits = model_resnet(data)
+#     print(logits)
+#     break
+
+
+# In[ ]:
+
+
+
+
+
+# In[146]:
 
 
 criterion = nn.CrossEntropyLoss()
@@ -224,7 +275,7 @@ def train_epoch(model, loader, optimizer):
         optimizer.zero_grad()
        
         data, target = data.to(device), target.to(device)
-        logits = model(data)    
+        logits = model(data)
 
         # print(logits)
         # print(target)
@@ -240,15 +291,25 @@ def train_epoch(model, loader, optimizer):
         smooth_loss = sum(train_loss[-100:]) / min(len(train_loss), 100)
         bar.set_description('loss: %.5f, smth: %.5f' % (loss_np, smooth_loss))
 
-
+        # 观察是否存在梯度消失
         # param_grad_list = []
         # for param in model.parameters():
         #     param_grad_list.append(param.grad.abs().sum())
-        # print(param_grad_list)
+        # print(param_grad_list[:2])
 
     train_loss = np.mean(train_loss)
     return train_loss
-    
+
+
+# In[147]:
+
+
+#train_loss = train_epoch(model, train_loader, optimizer)
+
+
+# In[148]:
+
+
 def val_epoch(model, loader, n_test=1):
 
     model.eval()
@@ -256,13 +317,16 @@ def val_epoch(model, loader, n_test=1):
     LOGITS = []
     PROBS = []
     TARGETS = []
+    bar = tqdm(loader)
     
     with torch.no_grad():
-        for (data, target) in tqdm(loader):
+        for (data, target) in bar:
             
             data, target = data.to(device), target.to(device)
             
             logits = model(data)
+            # print(logits)
+            # print(target)
             loss = criterion(logits, target)
             probs = logits.softmax(1)
 
@@ -283,130 +347,206 @@ def val_epoch(model, loader, n_test=1):
     PROBS = torch.cat(PROBS).numpy()
     TARGETS = torch.cat(TARGETS).numpy()
 
-    val_auc = roc_auc_score((TARGETS == 1).astype(float), PROBS[:, 1])    
-    return val_loss, val_auc
+    val_auc = roc_auc_score((TARGETS == 1).astype(float), PROBS[:, 1])  
+    val_pauc = pauc_cal((TARGETS == 1).astype(float), PROBS[:, 1])
+    acc = (PROBS.argmax(1) == TARGETS).mean() * 100.
+    
+    detection_rate = np.logical_and(PROBS.argmax(1)==1, TARGETS == 1).sum()/(TARGETS == 1).sum()* 100.
+    
+    return val_loss, val_auc, PROBS, TARGETS, acc, detection_rate, val_pauc
 
 
-# In[401]:
+# In[149]:
 
 
-torch.cat([logits.softmax(1),logits.softmax(1)])
+#@staticmethod
+def pauc_cal(y_true, y_scores, tpr_threshold=0.8):
+    from sklearn.metrics import roc_curve, auc
+        
+    # Rescale labels: set 0s to 1s and 1s to 0s (because sklearn only has max_fpr, not min_tpr)
+    rescaled_labels = abs(np.asarray(y_true) - 1)
+
+    # Flip the prediction scores to their complements (to work with rescaled label)
+    flipped_preds = -1.0 * np.asarray(y_scores)
+
+    # Calculate the maximum false positive rate based on the given TPR threshold
+    max_fpr = abs(1 - tpr_threshold)
+
+    # Calculate the ROC curve
+    fpr, tpr, _ = roc_curve(rescaled_labels, flipped_preds, sample_weight=None)
+
+    # Find the index where FPR exceeds max_fpr
+    interp_idx = np.searchsorted(fpr, max_fpr, 'right')
+
+    # Define points for linear interpolation
+    x_interp = [fpr[interp_idx - 1], fpr[interp_idx]]
+    y_interp = [tpr[interp_idx - 1], tpr[interp_idx]]
+
+    # Add interpolated point to TPR and FPR arrays
+    tpr = np.append(tpr[:interp_idx], np.interp(max_fpr, x_interp, y_interp))
+    fpr = np.append(fpr[:interp_idx], max_fpr)
+
+    # Calculate the partial AUC
+    partial_auc = auc(fpr, tpr)
+    
+    return partial_auc
 
 
-# In[402]:
+# In[157]:
 
 
-target
+traindf = MelanomaDataset(train_csv_fold, "train",train_hdf5_path,aug_transform)
+validdf = MelanomaDataset(valid_csv_fold, "train",train_hdf5_path,base_transform)
+train_loader = torch.utils.data.DataLoader(traindf, batch_size=32)
+valid_loader = torch.utils.data.DataLoader(validdf, batch_size=32)
+
+model = CNN(output_size=2, no_columns=3)
+#model = Resnest_Melanoma('resnest101', out_dim = 2, pretrained=False)
+
+optimizer = optim.Adam(model.parameters(), lr=0.0001)#lr=0.0001
+model.to(device)
 
 
-# In[403]:
+# In[151]:
 
 
-valid_csv_fold.shape
+# #模型信息打印
+# model.parameters()
+# for i in model.parameters():
+#     print(i.shape)
 
 
-# In[431]:
-
-
-
-
-
-# In[418]:
+# In[152]:
 
 
 # a = torch.tensor([[[1,2,3],[2,3,4]],[[0,0,0],[0,0,0]]])
 # a.sum(axis = 2)
 
 
-# In[419]:
+# In[153]:
 
 
 #train_loss = train_epoch(model, train_loader, optimizer)
 
 
-# In[420]:
+# In[154]:
 
 
-#valid_loss = val_epoch(model, valid_loader, optimizer)
+#val_loss, val_auc, PROBS, TARGETS, acc,  detection_rate= val_epoch(model, valid_loader, optimizer)
 
 
-# In[432]:
+# In[158]:
 
-
-traindf = MelanomaDataset(train_csv_fold, "train")
-validdf = MelanomaDataset(valid_csv_fold, "train")
-train_loader = torch.utils.data.DataLoader(traindf, batch_size=32)
-valid_loader = torch.utils.data.DataLoader(validdf, batch_size=32)
-
-model = CNN(output_size=2, no_columns=3)
-optimizer = optim.Adam(model.parameters(), lr=0.0001)
-
-device = torch.device("mps")
-model.to(device)
 
 # 开始训练
 train_loss_list = []
 val_loss_list = []
-val_auc_list = []
+val_pauc_list = []
 
-auc_max = 0.
-model_file = work_dir + 'auc_best_model.pth'
-for epoch in range(1, 11):
+pauc_max = 0.
+model_file = work_dir + 'auc_best_model_cnnhdf5.pth'
+for epoch in range(1, 30):
     train_loss = train_epoch(model, train_loader, optimizer)
-    val_loss, auc = val_epoch(model, valid_loader)
+    val_loss, auc, PROBS, TARGETS, acc, detection_rate, pauc = val_epoch(model, valid_loader)
     train_loss_list.append(train_loss)
     val_loss_list.append(val_loss)
-    val_auc_list.append(auc)
+    val_pauc_list.append(pauc)
 
-    if auc > auc_max:
-        print('auc_max ({:.6f} --> {:.6f}). Saving model ...'.format(auc_max, auc))
+    if pauc > pauc_max:
+        print('pauc_max ({:.6f} --> {:.6f}),acc {:.6f}, detection_rate:{:.6f}, Saving model ...'.format(pauc_max, pauc, acc,detection_rate))
         torch.save(model.state_dict(), model_file)
-        auc_max = auc
+        pauc_max = pauc
 
 
-# In[ ]:
+# In[159]:
 
 
-train_loss_list
-
-
-# In[423]:
-
-
-val_loss_list
-
-
-# In[424]:
-
-
-val_auc_list
-
-
-# In[433]:
-
-
-plt.plot(range(len(val_auc_list)), val_auc_list, label="val_auc_list")
+plt.plot(range(len(val_pauc_list)), val_pauc_list, label="val_pauc_list")
 plt.plot(range(len(train_loss_list)), train_loss_list, label="train_loss_list")
 plt.plot(range(len(val_loss_list)), val_loss_list, label="val_loss_list")
 #plt.plot( range(history.shape[0]), history["Valid AUROC"].values, label="Valid AUROC")
 plt.xlabel("epochs")
-plt.ylabel("AUROC")
+plt.ylabel("pAUROC")
 plt.grid()
 plt.legend()
 plt.show()
 
 
-# In[447]:
+# In[ ]:
 
 
-stack = {}
-if stack:
-    print("yes")
-    print(stack)
-if not stack:
-    print("no")
-    print(stack.add("1"))
-    print(stack)
+## 预测效果的可视化
+
+
+# In[168]:
+
+
+import random
+random.choice([1,2,3])
+
+
+# In[167]:
+
+
+
+
+
+# In[682]:
+
+
+plt.figure(figsize=(16,3))
+j = 1
+for i in range(validdf.__len__()):
+    if TARGETS[i]:
+        plt.subplot(2, 6, j)
+        plt.imshow(validdf.__getitem__(i)[0].permute(1, 2, 0)/225)
+        plt.axis('off')
+        j += 1
+    if j>12:
+        break
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[169]:
+
+
+
+
+
+# In[170]:
+
+
+# from torchvision import models
+# Inception = models.inception_v3(pretrained = False)
+# Resnet50 = models.resnet50(pretrained = True)
+# VGG = models.vgg19(pretrained = True)
+
+# Alexnet = models.alexnet(pretrained=True)
+# VGG_bn = models.vgg19_bn(pretrained = True)
+
+
+# In[ ]:
+
+
+VGG = models.vgg19(pretrained = True)
+VGG_bn = models.vgg19_bn(pretrained = True)
+
+
+# In[ ]:
+
+
+Alexnet = models.alexnet(pretrained=True)
 
 
 # In[ ]:
